@@ -849,6 +849,9 @@ static void checkmousemotion(int &dx, int &dy)
     }
 }
 
+VARP(wheelcooldown, 0, 150, 1000);
+VARP(wheelflip, 0, 0, 1);
+
 void checkinput()
 {
     SDL_Event event;
@@ -951,9 +954,22 @@ void checkinput()
                 break;
 
             case SDL_MOUSEWHEEL:
-                if(event.wheel.y > 0) { processkey(-4, true); processkey(-4, false); }
-                else if(event.wheel.y < 0) { processkey(-5, true); processkey(-5, false); }
+            {
+                int y = event.wheel.y;
+                if(event.wheel.direction == SDL_MOUSEWHEEL_FLIPPED) y = -y;
+                if(wheelflip) y = -y;
+                if(!y) break;
+                if(wheelcooldown > 0 && !mainmenu && !editmode && !g3d_windowhit(true, false))
+                {
+                    static Uint32 lastwheel = 0;
+                    Uint32 now = SDL_GetTicks();
+                    if(int(now - lastwheel) < wheelcooldown) break;
+                    lastwheel = now;
+                }
+                if(y > 0) { processkey(-4, true); processkey(-4, false); }
+                else { processkey(-5, true); processkey(-5, false); }
                 break;
+            }
         }
     }
     if(mousemoved) resetmousemotion();

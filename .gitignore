@@ -68,4 +68,21 @@ profile
 *.hmap
 *.ipa
 
+####
+# C/C++ build artifacts & binaries
+*.o
+*.a
+*.gch
+*.gch.tmp
+*.d
+src/sauer_client
+src/sauer_server
+src/sauer_master
+src/cube2font
+bin_unix/native_*
+
+####
+# clangd cache
+.cache/
+
 

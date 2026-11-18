@@ -57,11 +57,11 @@ ifneq (,$(STRIP))
   STRIP= $(TOOLCHAIN)strip
 endif
 endif
-OSXMIN= 10.6
+OSXMIN= 10.15
 override CC+= -arch x86_64 -mmacosx-version-min=$(OSXMIN)
 override CXX+= -arch x86_64 -mmacosx-version-min=$(OSXMIN)
-CLIENT_INCLUDES= $(INCLUDES) -Iinclude
-CLIENT_LIBS= -Fxcode/Frameworks -framework SDL2 -framework SDL2_image
+CLIENT_INCLUDES= $(INCLUDES) -Iinclude -Fxcode/Frameworks
+CLIENT_LIBS= -Fxcode/Frameworks -Wl,-rpath,@executable_path/xcode/Frameworks -framework SDL2 -framework SDL2_image
 CLIENT_LIBS+= -framework SDL2_mixer -framework CoreAudio -framework AudioToolbox
 CLIENT_LIBS+= -framework AudioUnit -framework OpenGL -framework Cocoa -lz -Lenet -lenet
 else
@@ -164,7 +164,7 @@ MASTER_OBJS= \
 SERVER_MASTER_OBJS= $(SERVER_OBJS) $(filter-out $(SERVER_OBJS),$(MASTER_OBJS))
 
 ifneq (,$(findstring DARWIN,$(PLATFORM)))
-CLIENT_OBJS+= xcode/macutils.o xcode/main.o xcode/Launcher.o
+CLIENT_OBJS+= xcode/main.o xcode/Launcher.o
 
 %.o: %.mm
 	$(CXX) $(CXXFLAGS) -c -o $@ $<
