@@ -453,6 +453,7 @@ namespace server
     int curmaprotation = 0;
 
     VAR(lockmaprotation, 0, 0, 2);
+    VAR(singlemapvote, 0, 1, 1);
 
     void maprotationreset()
     {
@@ -2107,6 +2108,12 @@ namespace server
             if(demorecord) enddemorecord();
             if(!ci->local || hasnonlocalclients())
                 sendservmsgf("%s forced %s on map %s", colorname(ci), modename(ci->modevote), ci->mapvote[0] ? ci->mapvote : "[new map]");
+            changemap(ci->mapvote, ci->modevote);
+        }
+        else if(singlemapvote)
+        {
+            if(demorecord) enddemorecord();
+            sendservmsgf("%s voted %s on map %s", colorname(ci), modename(ci->modevote), ci->mapvote[0] ? ci->mapvote : "[new map]");
             changemap(ci->mapvote, ci->modevote);
         }
         else
