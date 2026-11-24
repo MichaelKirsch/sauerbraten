@@ -902,6 +902,7 @@ namespace game
         gamespeed = 100;
         clearclients(false);
         clearkillfeed();
+        ai::cleartaunts();
         if(cleanup)
         {
             nextmode = gamemode = INT_MAX;

@@ -477,7 +477,7 @@ namespace game
         }
         addkillfeed(aname, dname, gun, suicide, d==h || actor==h, teamkill);
         deathstate(d);
-		ai::killed(d, actor);
+		ai::killed(d, actor, gun);
     }
 
     void timeupdate(int secs)
@@ -587,6 +587,7 @@ namespace game
         clearbouncers();
         clearragdolls();
         clearkillfeed();
+        ai::cleartaunts();
 
         clearteaminfo();
 

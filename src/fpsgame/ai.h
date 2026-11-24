@@ -188,11 +188,11 @@ namespace ai
         vector<int> route;
         vec target, spot;
         int enemy, enemyseen, enemymillis, weappref, prevnodes[NUMPREVNODES], targnode, targlast, targtime, targseq,
-            lastrun, lasthunt, lastaction, lastcheck, jumpseed, jumprand, blocktime, huntseq, blockseq, lastaimrnd;
+            lastrun, lasthunt, lastaction, lastcheck, jumpseed, jumprand, blocktime, huntseq, blockseq, lastaimrnd, lastchattaunt;
         float targyaw, targpitch, views[3], aimrnd[3];
         bool dontmove, becareful, tryreset, trywipe;
 
-        aiinfo()
+        aiinfo() : lastchattaunt(0)
         {
             clearsetup();
             reset();
@@ -308,7 +308,8 @@ namespace ai
 
 	extern void spawned(fpsent *d);
 	extern void damaged(fpsent *d, fpsent *e);
-	extern void killed(fpsent *d, fpsent *e);
+	extern void killed(fpsent *d, fpsent *e, int gun = -1);
+	extern void cleartaunts();
 	extern void itemspawned(int ent);
 
     extern void render();

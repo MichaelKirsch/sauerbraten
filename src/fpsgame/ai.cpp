@@ -12,6 +12,42 @@ namespace ai
 
     VAR(aidebug, 0, 0, 6);
     VAR(aiforcegun, -1, -1, NUMGUNS-1);
+    VARP(bottaunts, 0, 1, 1);
+    VARP(bottauntchance, 0, 30, 100);
+
+    struct pendingbottaunt
+    {
+        int cn;
+        int sendmillis;
+        string msg;
+    };
+    static vector<pendingbottaunt> pendingtaunts;
+    static int lastglobaltaunt = 0;
+
+    void cleartaunts()
+    {
+        pendingtaunts.setsize(0);
+        lastglobaltaunt = 0;
+    }
+
+    static void flushbottaunts()
+    {
+        if(intermission || pendingtaunts.empty()) return;
+        loopv(pendingtaunts)
+        {
+            pendingbottaunt &t = pendingtaunts[i];
+            if(totalmillis < t.sendmillis) continue;
+            fpsent *bot = getclient(t.cn);
+            if(bot && bot->ai && bot->state != CS_SPECTATOR)
+            {
+                if(bot->state == CS_ALIVE)
+                    particle_textcopy(bot->abovehead(), t.msg, PART_TEXT, 2000, 0x32FF64, 4.0f, -8);
+                conoutf(CON_CHAT, "%s:\f0 %s", colorname(bot), t.msg);
+                addmsg(N_TEXT, "rcs", bot, t.msg);
+            }
+            pendingtaunts.remove(i--);
+        }
+    }
 
     ICOMMAND(addbot, "s", (char *s), addmsg(N_ADDBOT, "ri", *s ? clamp(parseint(s), 1, 101) : -1));
     ICOMMAND(delbot, "", (), addmsg(N_DELBOT, "r"));
@@ -185,9 +221,14 @@ namespace ai
 
     void update()
     {
-        if(intermission) { loopv(players) if(players[i]->ai) players[i]->stopmoving(); }
+        if(intermission)
+        {
+            cleartaunts();
+            loopv(players) if(players[i]->ai) players[i]->stopmoving();
+        }
         else // fixed rate logic done out-of-sequence at 1 frame per second for each ai
         {
+            flushbottaunts();
             if(totalmillis-updatemillis > 1000)
             {
                 avoid();
@@ -590,9 +631,83 @@ namespace ai
         if(d->ai) setup(d);
     }
 
-    void killed(fpsent *d, fpsent *e)
+    static const char *pickbottaunt(fpsent *victim, fpsent *killer, int gun)
+    {
+        static const char * const generaltaunts[] =
+        {
+            "ez", "2ez", "get rekt", "sit down", "skill issue", "gn8", "good night",
+            "outplayed", "gg ez", "free frag", "diff", "bot diff", "l2p", "gg wp",
+            "clean", "deleted", "clapped", "ratio", "owned", "too slow", "npc movement",
+            "free", "cya", "next", "try again", "not even close", "uninstall",
+            "you tried", "gg next map", "bye",
+            "war der monitor an?", "maus vergessen?", "danke fuer den punkt",
+            "aim.exe not found", "hast du gelaggt oder war das echt?",
+            "tutorial uebersprungen?", "ich bin buchstaeblich ein bot",
+            "von einer ki geholt lol", "soll ich skill runterstellen?",
+            "war das ein warm-up?", "hast du mit trackpad gespielt?",
+            "sens auf 1000?", "fadenkreuz vergessen?", "das war ja fast ein treffer",
+            "standbild gehabt?", "soll ich kurz stehen bleiben?",
+            "ich ziele uebrigens mit zufallszahlen",
+            "meine if-else-schleife war schneller",
+            "sogar mein pathfinding ist besser als dein aim",
+            "das kostet dich miete in deinem kopf",
+            "war das schon full tryhard?", "bitte sag mir das war ein missclick",
+            "bruder ich hab keine haende",
+            "schau mal in den einstellungen ob schiessen belegt ist",
+            "kann man dir irgendwie helfen?",
+            "ich schreib das grad waehrend ich dich hole",
+            "war schoen mit dir", "kurze pause fuer dich",
+            "respekt, fast meine schulter gestreift",
+            "hab dich nicht mal gesehen ehrlich gesagt"
+        };
+        static const char * const fisttaunts[] = { "bonk", "geboxt", "fist > all", "humiliated" };
+        static const char * const pistoltaunts[] = { "mit der pistol??", "pew pew" };
+        static const char * const rifletaunts[] = { "rail diff", "one tapped", "zu langsam mit der rifle", "flicked", "headshot" };
+        static const char * const sgtaunts[] = { "geschreddert", "close range diff" };
+        static const char * const explodetaunts[] = { "boom", "airshot!!", "predictable" };
+        static const char * const ctftaunts[] = { "finger weg von der flagge", "meine flagge", "flag denied", "du kommst hier nicht weg", "nice try lmao" };
+
+        if(cmode && (cmode->hasobjective(victim) || cmode->hasobjective(killer)) && !rnd(3))
+            return ctftaunts[rnd(sizeof(ctftaunts)/sizeof(ctftaunts[0]))];
+
+        if(!rnd(3))
+        {
+            switch(gun)
+            {
+                case GUN_FIST:   return fisttaunts[rnd(sizeof(fisttaunts)/sizeof(fisttaunts[0]))];
+                case GUN_PISTOL: return pistoltaunts[rnd(sizeof(pistoltaunts)/sizeof(pistoltaunts[0]))];
+                case GUN_RIFLE:  return rifletaunts[rnd(sizeof(rifletaunts)/sizeof(rifletaunts[0]))];
+                case GUN_SG:     return sgtaunts[rnd(sizeof(sgtaunts)/sizeof(sgtaunts[0]))];
+                case GUN_RL:
+                case GUN_GL:     return explodetaunts[rnd(sizeof(explodetaunts)/sizeof(explodetaunts[0]))];
+                default: break;
+            }
+        }
+
+        static int lastidx = -1;
+        int n = sizeof(generaltaunts)/sizeof(generaltaunts[0]);
+        int idx = rnd(n);
+        if(n > 1 && idx == lastidx) idx = (idx + 1 + rnd(n - 1)) % n;
+        lastidx = idx;
+        return generaltaunts[idx];
+    }
+
+    void killed(fpsent *d, fpsent *e, int gun)
     {
         if(d->ai) d->ai->reset();
+        if(bottaunts && bottauntchance > 0 && e && e->ai && e->aitype == AI_BOT && e != d && d->aitype == AI_NONE && !isteam(d->team, e->team))
+        {
+            bool botready = !e->ai->lastchattaunt || totalmillis - e->ai->lastchattaunt >= 6000;
+            bool globalready = !lastglobaltaunt || totalmillis - lastglobaltaunt >= 3500;
+            if(botready && globalready && rnd(100) < bottauntchance)
+            {
+                e->ai->lastchattaunt = lastglobaltaunt = totalmillis;
+                pendingbottaunt &t = pendingtaunts.add();
+                t.cn = e->clientnum;
+                t.sendmillis = totalmillis + 400 + rnd(900);
+                copystring(t.msg, pickbottaunt(d, e, gun));
+            }
+        }
     }
 
     void itemspawned(int ent)
