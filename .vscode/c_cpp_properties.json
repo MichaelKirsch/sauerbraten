@@ -1,0 +1,34 @@
+{
+  "configurations": [
+    {
+      "name": "Mac (Rosetta x86_64)",
+      "includePath": [
+        "${workspaceFolder}/src/shared",
+        "${workspaceFolder}/src/engine",
+        "${workspaceFolder}/src/fpsgame",
+        "${workspaceFolder}/src/enet/include",
+        "${workspaceFolder}/src/include"
+      ],
+      "macFrameworkPath": [
+        "${workspaceFolder}/src/xcode/Frameworks",
+        "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks"
+      ],
+      "defines": [
+        "__APPLE__",
+        "GL_SILENCE_DEPRECATION"
+      ],
+      "compilerPath": "/usr/bin/clang++",
+      "compilerArgs": [
+        "-arch",
+        "x86_64",
+        "-fsigned-char",
+        "-fno-exceptions",
+        "-fno-rtti"
+      ],
+      "cStandard": "c11",
+      "cppStandard": "c++14",
+      "intelliSenseMode": "macos-clang-x64"
+    }
+  ],
+  "version": 4
+}

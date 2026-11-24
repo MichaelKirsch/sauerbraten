@@ -1,0 +1,1362 @@
+#include "game.h"
+
+namespace game
+{
+    bool intermission = false;
+    int maptime = 0, maprealtime = 0, maplimit = -1;
+    int respawnent = -1;
+    int lasthit = 0, lastspawnattempt = 0;
+
+    int following = -1, followdir = 0;
+
+    fpsent *player1 = NULL;         // our client
+    vector<fpsent *> players;       // other clients
+    int savedammo[NUMGUNS];
+
+    bool clientoption(const char *arg) { return false; }
+
+    void taunt()
+    {
+        if(player1->state!=CS_ALIVE || player1->physstate<PHYS_SLOPE) return;
+        if(lastmillis-player1->lasttaunt<1000) return;
+        player1->lasttaunt = lastmillis;
+        addmsg(N_TAUNT, "rc", player1);
+    }
+    COMMAND(taunt, "");
+
+    ICOMMAND(getfollow, "", (),
+    {
+        fpsent *f = followingplayer();
+        intret(f ? f->clientnum : -1);
+    });
+
+	void follow(char *arg)
+    {
+        if(arg[0] ? player1->state==CS_SPECTATOR : following>=0)
+        {
+            following = arg[0] ? parseplayer(arg) : -1;
+            if(following==player1->clientnum) following = -1;
+            followdir = 0;
+            conoutf("follow %s", following>=0 ? "on" : "off");
+        }
+	}
+    COMMAND(follow, "s");
+
+    void nextfollow(int dir)
+    {
+        if(player1->state!=CS_SPECTATOR || clients.empty())
+        {
+            stopfollowing();
+            return;
+        }
+        int cur = following >= 0 ? following : (dir < 0 ? clients.length() - 1 : 0);
+        loopv(clients)
+        {
+            cur = (cur + dir + clients.length()) % clients.length();
+            if(clients[cur] && clients[cur]->state!=CS_SPECTATOR)
+            {
+                if(following<0) conoutf("follow on");
+                following = cur;
+                followdir = dir;
+                return;
+            }
+        }
+        stopfollowing();
+    }
+    ICOMMAND(nextfollow, "i", (int *dir), nextfollow(*dir < 0 ? -1 : 1));
+
+
+    const char *getclientmap() { return clientmap; }
+
+    void resetgamestate()
+    {
+        if(m_classicsp)
+        {
+            clearmovables();
+            clearmonsters();                 // all monsters back at their spawns for editing
+            entities::resettriggers();
+        }
+        clearprojectiles();
+        clearbouncers();
+    }
+
+    fpsent *spawnstate(fpsent *d)              // reset player state not persistent accross spawns
+    {
+        d->respawn();
+        d->spawnstate(gamemode);
+        return d;
+    }
+
+    void respawnself()
+    {
+        if(ispaused()) return;
+        if(m_mp(gamemode))
+        {
+            int seq = (player1->lifesequence<<16)|((lastmillis/1000)&0xFFFF);
+            if(player1->respawned!=seq) { addmsg(N_TRYSPAWN, "rc", player1); player1->respawned = seq; }
+        }
+        else
+        {
+            spawnplayer(player1);
+            showscores(false);
+            lasthit = 0;
+            if(cmode) cmode->respawned(player1);
+        }
+    }
+
+    fpsent *pointatplayer()
+    {
+        loopv(players) if(players[i] != player1 && intersect(players[i], player1->o, worldpos)) return players[i];
+        return NULL;
+    }
+
+    void stopfollowing()
+    {
+        if(following<0) return;
+        following = -1;
+        followdir = 0;
+        conoutf("follow off");
+    }
+
+    fpsent *followingplayer()
+    {
+        if(player1->state!=CS_SPECTATOR || following<0) return NULL;
+        fpsent *target = getclient(following);
+        if(target && target->state!=CS_SPECTATOR) return target;
+        return NULL;
+    }
+
+    fpsent *hudplayer()
+    {
+        if(thirdperson) return player1;
+        fpsent *target = followingplayer();
+        return target ? target : player1;
+    }
+
+    void setupcamera()
+    {
+        fpsent *target = followingplayer();
+        if(target)
+        {
+            player1->yaw = target->yaw;
+            player1->pitch = target->state==CS_DEAD ? 0 : target->pitch;
+            player1->o = target->o;
+            player1->resetinterp();
+        }
+    }
+
+    bool detachcamera()
+    {
+        fpsent *d = hudplayer();
+        return d->state==CS_DEAD;
+    }
+
+    bool collidecamera()
+    {
+        switch(player1->state)
+        {
+            case CS_EDITING: return false;
+            case CS_SPECTATOR: return followingplayer()!=NULL;
+        }
+        return true;
+    }
+
+    VARP(smoothmove, 0, 75, 100);
+    VARP(smoothdist, 0, 32, 64);
+
+    void predictplayer(fpsent *d, bool move)
+    {
+        d->o = d->newpos;
+        d->yaw = d->newyaw;
+        d->pitch = d->newpitch;
+        d->roll = d->newroll;
+        if(move)
+        {
+            moveplayer(d, 1, false);
+            d->newpos = d->o;
+        }
+        float k = 1.0f - float(lastmillis - d->smoothmillis)/smoothmove;
+        if(k>0)
+        {
+            d->o.add(vec(d->deltapos).mul(k));
+            d->yaw += d->deltayaw*k;
+            if(d->yaw<0) d->yaw += 360;
+            else if(d->yaw>=360) d->yaw -= 360;
+            d->pitch += d->deltapitch*k;
+            d->roll += d->deltaroll*k;
+        }
+    }
+
+    void otherplayers(int curtime)
+    {
+        loopv(players)
+        {
+            fpsent *d = players[i];
+            if(d == player1 || d->ai) continue;
+
+            if(d->state==CS_DEAD && d->ragdoll) moveragdoll(d);
+            else if(!intermission)
+            {
+                if(lastmillis - d->lastaction >= d->gunwait) d->gunwait = 0;
+                if(d->quadmillis) entities::checkquad(curtime, d);
+            }
+
+            const int lagtime = totalmillis-d->lastupdate;
+            if(!lagtime || intermission) continue;
+            else if(lagtime>1000 && d->state==CS_ALIVE)
+            {
+                d->state = CS_LAGGED;
+                continue;
+            }
+            if(d->state==CS_ALIVE || d->state==CS_EDITING)
+            {
+                if(smoothmove && d->smoothmillis>0) predictplayer(d, true);
+                else moveplayer(d, 1, false);
+            }
+            else if(d->state==CS_DEAD && !d->ragdoll && lastmillis-d->lastpain<2000) moveplayer(d, 1, true);
+        }
+    }
+
+    VARFP(slowmosp, 0, 0, 1, { if(m_sp && !slowmosp) server::forcegamespeed(100); }); 
+
+    void checkslowmo()
+    {
+        static int lastslowmohealth = 0;
+        server::forcegamespeed(intermission ? 100 : clamp(player1->health, 25, 200));
+        if(player1->health<player1->maxhealth && lastmillis-max(maptime, lastslowmohealth)>player1->health*player1->health/2)
+        {
+            lastslowmohealth = lastmillis;
+            player1->health++;
+        }
+    }
+
+    void updateworld()        // main game update loop
+    {
+        if(!maptime) { maptime = lastmillis; maprealtime = totalmillis; return; }
+        if(!curtime) { gets2c(); if(player1->clientnum>=0) c2sinfo(); return; }
+
+        physicsframe();
+        ai::navigate();
+        if(player1->state != CS_DEAD && !intermission)
+        {
+            if(player1->quadmillis) entities::checkquad(curtime, player1);
+        }
+        updateweapons(curtime);
+        otherplayers(curtime);
+        ai::update();
+        moveragdolls();
+        gets2c();
+        updatemovables(curtime);
+        updatemonsters(curtime);
+        if(connected)
+        {
+            if(player1->state == CS_DEAD)
+            {
+                if(player1->ragdoll) moveragdoll(player1);
+                else if(lastmillis-player1->lastpain<2000)
+                {
+                    player1->move = player1->strafe = 0;
+                    moveplayer(player1, 10, true);
+                }
+            }
+            else if(!intermission)
+            {
+                if(player1->ragdoll) cleanragdoll(player1);
+                moveplayer(player1, 10, true);
+                swayhudgun(curtime);
+                entities::checkitems(player1);
+                if(m_sp)
+                {
+                    if(slowmosp) checkslowmo();
+                    if(m_classicsp) entities::checktriggers();
+                }
+                else if(cmode) cmode->checkitems(player1);
+            }
+        }
+        if(player1->clientnum>=0) c2sinfo();   // do this last, to reduce the effective frame lag
+    }
+
+    void spawnplayer(fpsent *d)   // place at random spawn
+    {
+        if(cmode) cmode->pickspawn(d);
+        else findplayerspawn(d, d==player1 && respawnent>=0 ? respawnent : -1);
+        spawnstate(d);
+        if(d==player1)
+        {
+            if(editmode) d->state = CS_EDITING;
+            else if(d->state != CS_SPECTATOR) d->state = CS_ALIVE;
+        }
+        else d->state = CS_ALIVE;
+    }
+
+    VARP(spawnwait, 0, 0, 1000);
+
+    void respawn()
+    {
+        if(player1->state==CS_DEAD)
+        {
+            player1->attacking = false;
+            int wait = cmode ? cmode->respawnwait(player1) : 0;
+            if(wait>0)
+            {
+                lastspawnattempt = lastmillis;
+                //conoutf(CON_GAMEINFO, "\f2you must wait %d second%s before respawn!", wait, wait!=1 ? "s" : "");
+                return;
+            }
+            if(lastmillis < player1->lastpain + spawnwait) return;
+            if(m_dmsp) { changemap(clientmap, gamemode); return; }    // if we die in SP we try the same map again
+            respawnself();
+            if(m_classicsp)
+            {
+                conoutf(CON_GAMEINFO, "\f2You wasted another life! The monsters stole your armour and some ammo...");
+                loopi(NUMGUNS) if(i!=GUN_PISTOL && (player1->ammo[i] = savedammo[i]) > 5) player1->ammo[i] = max(player1->ammo[i]/3, 5);
+            }
+        }
+    }
+
+    // inputs
+
+    void doattack(bool on)
+    {
+        if(!connected || intermission) return;
+        if((player1->attacking = on)) respawn();
+    }
+
+    bool canjump()
+    {
+        if(!connected || intermission) return false;
+        respawn();
+        return player1->state!=CS_DEAD;
+    }
+
+    bool allowmove(physent *d)
+    {
+        if(d->type!=ENT_PLAYER) return true;
+        return !((fpsent *)d)->lasttaunt || lastmillis-((fpsent *)d)->lasttaunt>=1000;
+    }
+
+    VARP(hitsound, 0, 0, 1);
+
+    void damaged(int damage, fpsent *d, fpsent *actor, bool local, int gun)
+    {
+        if((d->state!=CS_ALIVE && d->state != CS_LAGGED && d->state != CS_SPAWNING) || intermission) return;
+
+        if(local) damage = d->dodamage(damage);
+        else if(actor==player1) return;
+
+        fpsent *h = hudplayer();
+        if(h!=player1 && actor==h && d!=actor)
+        {
+            if(hitsound && lasthit != lastmillis) playsound(S_HIT);
+            lasthit = lastmillis;
+        }
+        if(d==h)
+        {
+            damageblend(damage);
+            damagecompass(damage, actor->o);
+        }
+        damageeffect(damage, d, d!=h);
+
+		ai::damaged(d, actor);
+
+        if(m_sp && slowmosp && d==player1 && d->health < 1) d->health = 1;
+
+        if(d->health<=0) { if(local) killed(d, actor, gun); }
+        else if(d==h) playsound(S_PAIN6);
+        else playsound(S_PAIN1+rnd(5), &d->o);
+    }
+
+    VARP(deathscore, 0, 1, 1);
+
+    void deathstate(fpsent *d, bool restore)
+    {
+        d->state = CS_DEAD;
+        d->lastpain = lastmillis;
+        if(!restore) gibeffect(max(-d->health, 0), d->vel, d);
+        if(d==player1)
+        {
+            if(deathscore) showscores(true);
+            disablezoom();
+            if(!restore) loopi(NUMGUNS) savedammo[i] = player1->ammo[i];
+            d->attacking = false;
+            if(!restore) d->deaths++;
+            //d->pitch = 0;
+            d->roll = 0;
+            playsound(S_DIE1+rnd(2));
+        }
+        else
+        {
+            d->move = d->strafe = 0;
+            d->resetinterp();
+            d->smoothmillis = 0;
+            playsound(S_DIE1+rnd(2), &d->o);
+        }
+    }
+
+    VARP(teamcolorfrags, 0, 1, 1);
+    VARP(killfeed, 0, 1, 1);
+    VARP(killfeedtime, 1000, 5000, 30000);
+    VARP(killfeedfade, 0, 1000, 10000);
+
+    static const int MAXKILLFEED = 4;
+
+    struct killfeedentry
+    {
+        string killer, victim;
+        int gun;
+        int time;
+        bool suicide;
+        bool selfinvolved;
+        bool teamkill;
+    };
+    static vector<killfeedentry> killfeedentries;
+
+    void clearkillfeed()
+    {
+        killfeedentries.setsize(0);
+    }
+
+    static void addkillfeed(const char *killer, const char *victim, int gun, bool suicide, bool selfinvolved, bool teamkill)
+    {
+        if(!killfeed) return;
+        killfeedentry e;
+        copystring(e.killer, killer ? killer : "");
+        copystring(e.victim, victim ? victim : "");
+        e.gun = gun;
+        e.time = totalmillis;
+        e.suicide = suicide;
+        e.selfinvolved = selfinvolved;
+        e.teamkill = teamkill;
+        killfeedentries.insert(0, e);
+        if(killfeedentries.length() > MAXKILLFEED) killfeedentries.setsize(MAXKILLFEED);
+    }
+
+    void killed(fpsent *d, fpsent *actor, int gun)
+    {
+        if(d->state==CS_EDITING)
+        {
+            d->editstate = CS_DEAD;
+            if(d==player1) d->deaths++;
+            else d->resetinterp();
+            return;
+        }
+        else if((d->state!=CS_ALIVE && d->state != CS_LAGGED && d->state != CS_SPAWNING) || intermission) return;
+
+        fpsent *h = followingplayer();
+        if(!h) h = player1;
+        int contype = d==h || actor==h ? CON_FRAG_SELF : CON_FRAG_OTHER;
+        const char *dname = "", *aname = "";
+        if(m_teammode && teamcolorfrags)
+        {
+            dname = teamcolorname(d, "you");
+            aname = teamcolorname(actor, "you");
+        }
+        else
+        {
+            dname = colorname(d, NULL, "", "", "you");
+            aname = colorname(actor, NULL, "", "", "you");
+        }
+        bool suicide = d==actor || actor->type==ENT_INANIMATE;
+        bool teamkill = false;
+        if(actor->type==ENT_AI)
+            conoutf(contype, "\f2%s got killed by %s!", dname, aname);
+        else if(suicide)
+            conoutf(contype, "\f2%s suicided%s", dname, d==player1 ? "!" : "");
+        else if(isteam(d->team, actor->team))
+        {
+            teamkill = true;
+            contype |= CON_TEAMKILL;
+            if(actor==player1) conoutf(contype, "\f6%s fragged a teammate (%s)", aname, dname);
+            else if(d==player1) conoutf(contype, "\f6%s got fragged by a teammate (%s)", dname, aname);
+            else conoutf(contype, "\f2%s fragged a teammate (%s)", aname, dname);
+        }
+        else
+        {
+            if(d==player1) conoutf(contype, "\f2%s got fragged by %s", dname, aname);
+            else conoutf(contype, "\f2%s fragged %s", aname, dname);
+        }
+        addkillfeed(aname, dname, gun, suicide, d==h || actor==h, teamkill);
+        deathstate(d);
+		ai::killed(d, actor);
+    }
+
+    void timeupdate(int secs)
+    {
+        if(secs > 0)
+        {
+            maplimit = lastmillis + secs*1000;
+        }
+        else
+        {
+            intermission = true;
+            player1->attacking = false;
+            if(cmode) cmode->gameover();
+            conoutf(CON_GAMEINFO, "\f2intermission:");
+            conoutf(CON_GAMEINFO, "\f2game has ended!");
+            if(m_ctf) conoutf(CON_GAMEINFO, "\f2player frags: %d, flags: %d, deaths: %d", player1->frags, player1->flags, player1->deaths);
+            else if(m_collect) conoutf(CON_GAMEINFO, "\f2player frags: %d, skulls: %d, deaths: %d", player1->frags, player1->flags, player1->deaths);
+            else conoutf(CON_GAMEINFO, "\f2player frags: %d, deaths: %d", player1->frags, player1->deaths);
+            int accuracy = (player1->totaldamage*100)/max(player1->totalshots, 1);
+            conoutf(CON_GAMEINFO, "\f2player total damage dealt: %d, damage wasted: %d, accuracy(%%): %d", player1->totaldamage, player1->totalshots-player1->totaldamage, accuracy);
+            if(m_sp) spsummary(accuracy);
+
+            showscores(true);
+            disablezoom();
+            
+            if(identexists("intermission")) execute("intermission");
+        }
+    }
+
+    ICOMMAND(getfrags, "", (), intret(player1->frags));
+    ICOMMAND(getflags, "", (), intret(player1->flags));
+    ICOMMAND(getdeaths, "", (), intret(player1->deaths));
+    ICOMMAND(getaccuracy, "", (), intret((player1->totaldamage*100)/max(player1->totalshots, 1)));
+    ICOMMAND(gettotaldamage, "", (), intret(player1->totaldamage));
+    ICOMMAND(gettotalshots, "", (), intret(player1->totalshots));
+
+    vector<fpsent *> clients;
+
+    fpsent *newclient(int cn)   // ensure valid entity
+    {
+        if(cn < 0 || cn > max(0xFF, MAXCLIENTS + MAXBOTS))
+        {
+            neterr("clientnum", false);
+            return NULL;
+        }
+
+        if(cn == player1->clientnum) return player1;
+
+        while(cn >= clients.length()) clients.add(NULL);
+        if(!clients[cn])
+        {
+            fpsent *d = new fpsent;
+            d->clientnum = cn;
+            clients[cn] = d;
+            players.add(d);
+        }
+        return clients[cn];
+    }
+
+    fpsent *getclient(int cn)   // ensure valid entity
+    {
+        if(cn == player1->clientnum) return player1;
+        return clients.inrange(cn) ? clients[cn] : NULL;
+    }
+
+    void clientdisconnected(int cn, bool notify)
+    {
+        if(!clients.inrange(cn)) return;
+        if(following==cn)
+        {
+            if(followdir) nextfollow(followdir);
+            else stopfollowing();
+        }
+        unignore(cn);
+        fpsent *d = clients[cn];
+        if(!d) return;
+        if(notify && d->name[0]) conoutf("\f4leave:\f7 %s", colorname(d));
+        removeweapons(d);
+        removetrackedparticles(d);
+        removetrackeddynlights(d);
+        if(cmode) cmode->removeplayer(d);
+        players.removeobj(d);
+        DELETEP(clients[cn]);
+        cleardynentcache();
+    }
+
+    void clearclients(bool notify)
+    {
+        loopv(clients) if(clients[i]) clientdisconnected(i, notify);
+    }
+
+    void initclient()
+    {
+        player1 = spawnstate(new fpsent);
+        filtertext(player1->name, "unnamed", false, false, MAXNAMELEN);
+        players.add(player1);
+    }
+
+    VARP(showmodeinfo, 0, 1, 1);
+
+    void startgame()
+    {
+        clearmovables();
+        clearmonsters();
+
+        clearprojectiles();
+        clearbouncers();
+        clearragdolls();
+        clearkillfeed();
+
+        clearteaminfo();
+
+        // reset perma-state
+        loopv(players)
+        {
+            fpsent *d = players[i];
+            d->frags = d->flags = 0;
+            d->deaths = 0;
+            d->totaldamage = 0;
+            d->totalshots = 0;
+            d->maxhealth = 100;
+            d->lifesequence = -1;
+            d->respawned = d->suicided = -2;
+        }
+
+        setclientmode();
+
+        intermission = false;
+        maptime = maprealtime = 0;
+        maplimit = -1;
+
+        if(cmode)
+        {
+            cmode->preload();
+            cmode->setup();
+        }
+
+        conoutf(CON_GAMEINFO, "\f2game mode is %s", server::modename(gamemode));
+
+        if(m_sp)
+        {
+            defformatstring(scorename, "bestscore_%s", getclientmap());
+            const char *best = getalias(scorename);
+            if(*best) conoutf(CON_GAMEINFO, "\f2try to beat your best score so far: %s", best);
+        }
+        else
+        {
+            const char *info = m_valid(gamemode) ? gamemodes[gamemode - STARTGAMEMODE].info : NULL;
+            if(showmodeinfo && info) conoutf(CON_GAMEINFO, "\f0%s", info);
+        }
+
+        if(player1->playermodel != playermodel) switchplayermodel(playermodel);
+
+        showscores(false);
+        disablezoom();
+        lasthit = 0;
+
+        if(identexists("mapstart")) execute("mapstart");
+    }
+
+    void loadingmap(const char *name)
+    {
+        if(identexists("playsong")) execute("playsong");
+    }
+
+    void startmap(const char *name)   // called just after a map load
+    {
+        ai::savewaypoints();
+        ai::clearwaypoints(true);
+
+        respawnent = -1; // so we don't respawn at an old spot
+        if(!m_mp(gamemode)) spawnplayer(player1);
+        else findplayerspawn(player1, -1);
+        entities::resetspawns();
+        copystring(clientmap, name ? name : "");
+        
+        sendmapinfo();
+    }
+
+    const char *getmapinfo()
+    {
+        return showmodeinfo && m_valid(gamemode) ? gamemodes[gamemode - STARTGAMEMODE].info : NULL;
+    }
+
+    void physicstrigger(physent *d, bool local, int floorlevel, int waterlevel, int material)
+    {
+        if(d->type==ENT_INANIMATE) return;
+        if     (waterlevel>0) { if(material!=MAT_LAVA) playsound(S_SPLASH1, d==player1 ? NULL : &d->o); }
+        else if(waterlevel<0) playsound(material==MAT_LAVA ? S_BURN : S_SPLASH2, d==player1 ? NULL : &d->o);
+        if     (floorlevel>0) { if(d==player1 || d->type!=ENT_PLAYER || ((fpsent *)d)->ai) msgsound(S_JUMP, d); }
+        else if(floorlevel<0) { if(d==player1 || d->type!=ENT_PLAYER || ((fpsent *)d)->ai) msgsound(S_LAND, d); }
+    }
+
+    void dynentcollide(physent *d, physent *o, const vec &dir)
+    {
+        switch(d->type)
+        {
+            case ENT_AI: if(dir.z > 0) stackmonster((monster *)d, o); break;
+            case ENT_INANIMATE: if(dir.z > 0) stackmovable((movable *)d, o); break;
+        }
+    }
+
+    void msgsound(int n, physent *d)
+    {
+        if(!d || d==player1)
+        {
+            addmsg(N_SOUND, "ci", d, n);
+            playsound(n);
+        }
+        else
+        {
+            if(d->type==ENT_PLAYER && ((fpsent *)d)->ai)
+                addmsg(N_SOUND, "ci", d, n);
+            playsound(n, &d->o);
+        }
+    }
+
+    int numdynents() { return players.length()+monsters.length()+movables.length(); }
+
+    dynent *iterdynents(int i)
+    {
+        if(i<players.length()) return players[i];
+        i -= players.length();
+        if(i<monsters.length()) return (dynent *)monsters[i];
+        i -= monsters.length();
+        if(i<movables.length()) return (dynent *)movables[i];
+        return NULL;
+    }
+
+    bool duplicatename(fpsent *d, const char *name = NULL, const char *alt = NULL)
+    {
+        if(!name) name = d->name;
+        if(alt && d != player1 && !strcmp(name, alt)) return true;
+        loopv(players) if(d!=players[i] && !strcmp(name, players[i]->name)) return true;
+        return false;
+    }
+
+    static string cname[3];
+    static int cidx = 0;
+
+    const char *colorname(fpsent *d, const char *name, const char *prefix, const char *suffix, const char *alt)
+    {
+        if(!name) name = alt && d == player1 ? alt : d->name; 
+        bool dup = !name[0] || duplicatename(d, name, alt) || d->aitype != AI_NONE;
+        if(dup || prefix[0] || suffix[0])
+        {
+            cidx = (cidx+1)%3;
+            if(dup) formatstring(cname[cidx], d->aitype == AI_NONE ? "%s%s \fs\f5(%d)\fr%s" : "%s%s \fs\f5[%d]\fr%s", prefix, name, d->clientnum, suffix);
+            else formatstring(cname[cidx], "%s%s%s", prefix, name, suffix);
+            return cname[cidx];
+        }
+        return name;
+    }
+
+    VARP(teamcolortext, 0, 1, 1);
+
+    const char *teamcolorname(fpsent *d, const char *alt)
+    {
+        if(!teamcolortext || !m_teammode) return colorname(d, NULL, "", "", alt);
+        return colorname(d, NULL, isteam(d->team, player1->team) ? "\fs\f1" : "\fs\f3", "\fr", alt); 
+    }
+
+    const char *teamcolor(const char *name, bool sameteam, const char *alt)
+    {
+        if(!teamcolortext || !m_teammode) return sameteam || !alt ? name : alt;
+        cidx = (cidx+1)%3;
+        formatstring(cname[cidx], sameteam ? "\fs\f1%s\fr" : "\fs\f3%s\fr", sameteam || !alt ? name : alt);
+        return cname[cidx];
+    }    
+    
+    const char *teamcolor(const char *name, const char *team, const char *alt)
+    {
+        return teamcolor(name, team && isteam(team, player1->team), alt);
+    }
+
+    void suicide(physent *d)
+    {
+        if(d==player1 || (d->type==ENT_PLAYER && ((fpsent *)d)->ai))
+        {
+            if(d->state!=CS_ALIVE) return;
+            fpsent *pl = (fpsent *)d;
+            if(!m_mp(gamemode)) killed(pl, pl);
+            else 
+            {
+                int seq = (pl->lifesequence<<16)|((lastmillis/1000)&0xFFFF);
+                if(pl->suicided!=seq) { addmsg(N_SUICIDE, "rc", pl); pl->suicided = seq; }
+            }
+        }
+        else if(d->type==ENT_AI) suicidemonster((monster *)d);
+        else if(d->type==ENT_INANIMATE) suicidemovable((movable *)d);
+    }
+    ICOMMAND(suicide, "", (), suicide(player1));
+
+    bool needminimap() { return m_ctf || m_protect || m_hold || m_capture || m_collect; }
+
+    void drawicon(int icon, float x, float y, float sz)
+    {
+        settexture("packages/hud/items.png");
+        float tsz = 0.25f, tx = tsz*(icon%4), ty = tsz*(icon/4);
+        gle::defvertex(2);
+        gle::deftexcoord0();
+        gle::begin(GL_TRIANGLE_STRIP);
+        gle::attribf(x,    y);    gle::attribf(tx,     ty);
+        gle::attribf(x+sz, y);    gle::attribf(tx+tsz, ty);
+        gle::attribf(x,    y+sz); gle::attribf(tx,     ty+tsz);
+        gle::attribf(x+sz, y+sz); gle::attribf(tx+tsz, ty+tsz);
+        gle::end();
+    }
+
+    float abovegameplayhud(int w, int h)
+    {
+        switch(hudplayer()->state)
+        {
+            case CS_EDITING:
+            case CS_SPECTATOR:
+                return 1;
+            default:
+                return 1650.0f/1800.0f;
+        }
+    }
+
+    int ammohudup[3] = { GUN_CG, GUN_RL, GUN_GL },
+        ammohuddown[3] = { GUN_RIFLE, GUN_SG, GUN_PISTOL },
+        ammohudcycle[7] = { -1, -1, -1, -1, -1, -1, -1 };
+
+    ICOMMAND(ammohudup, "V", (tagval *args, int numargs),
+    {
+        loopi(3) ammohudup[i] = i < numargs ? getweapon(args[i].getstr()) : -1;
+    });
+
+    ICOMMAND(ammohuddown, "V", (tagval *args, int numargs),
+    {
+        loopi(3) ammohuddown[i] = i < numargs ? getweapon(args[i].getstr()) : -1;
+    });
+
+    ICOMMAND(ammohudcycle, "V", (tagval *args, int numargs),
+    {
+        loopi(7) ammohudcycle[i] = i < numargs ? getweapon(args[i].getstr()) : -1;
+    });
+
+    VARP(ammohud, 0, 1, 1);
+
+    void drawammohud(fpsent *d)
+    {
+        float x = HICON_X + 2*HICON_STEP, y = HICON_Y, sz = HICON_SIZE;
+        pushhudmatrix();
+        hudmatrix.scale(1/3.2f, 1/3.2f, 1);
+        flushhudmatrix();
+        float xup = (x+sz)*3.2f, yup = y*3.2f + 0.1f*sz;
+        loopi(3)
+        {
+            int gun = ammohudup[i];
+            if(gun < GUN_FIST || gun > GUN_PISTOL || gun == d->gunselect || !d->ammo[gun]) continue;
+            drawicon(HICON_FIST+gun, xup, yup, sz);
+            yup += sz;
+        }
+        float xdown = x*3.2f - sz, ydown = (y+sz)*3.2f - 0.1f*sz;
+        loopi(3)
+        {
+            int gun = ammohuddown[3-i-1];
+            if(gun < GUN_FIST || gun > GUN_PISTOL || gun == d->gunselect || !d->ammo[gun]) continue;
+            ydown -= sz;
+            drawicon(HICON_FIST+gun, xdown, ydown, sz);
+        }
+        int offset = 0, num = 0;
+        loopi(7)
+        {
+            int gun = ammohudcycle[i];
+            if(gun < GUN_FIST || gun > GUN_PISTOL) continue;
+            if(gun == d->gunselect) offset = i + 1;
+            else if(d->ammo[gun]) num++;
+        }
+        float xcycle = (x+sz/2)*3.2f + 0.5f*num*sz, ycycle = y*3.2f-sz;
+        loopi(7)
+        {
+            int gun = ammohudcycle[(i + offset)%7];
+            if(gun < GUN_FIST || gun > GUN_PISTOL || gun == d->gunselect || !d->ammo[gun]) continue;
+            xcycle -= sz;
+            drawicon(HICON_FIST+gun, xcycle, ycycle, sz);
+        }
+        pophudmatrix();
+    }
+
+    static const float WEAPONBOX_W = 132.0f, WEAPONBOX_H = 128.0f, WEAPONBOX_GAP = 10.0f;
+    static const float WEAPONBAR_W = 7*WEAPONBOX_W + 6*WEAPONBOX_GAP;
+
+    static float weaponbarx(int w, int h)
+    {
+        return max(750.0f, (1800.0f*w/h - WEAPONBAR_W)*0.5f);
+    }
+
+    int hudextrax(int w, int h)
+    {
+        return int(weaponbarx(w, h) + WEAPONBAR_W + 50.0f);
+    }
+
+    static void drawsolidrect(float x, float y, float w, float h)
+    {
+        gle::defvertex(2);
+        gle::begin(GL_TRIANGLE_STRIP);
+        gle::attribf(x,   y);
+        gle::attribf(x+w, y);
+        gle::attribf(x,   y+h);
+        gle::attribf(x+w, y+h);
+        gle::end();
+    }
+
+    static void drawboxborder(float x, float y, float w, float h, float t)
+    {
+        drawsolidrect(x,     y,     w, t);
+        drawsolidrect(x,     y+h-t, w, t);
+        drawsolidrect(x,     y+t,   t, h-2*t);
+        drawsolidrect(x+w-t, y+t,   t, h-2*t);
+    }
+
+    void drawweaponhud(fpsent *d, int w, int h)
+    {
+        static const int gunsorder[7] = { GUN_SG, GUN_CG, GUN_RL, GUN_RIFLE, GUN_GL, GUN_PISTOL, GUN_FIST };
+        static const char * const abbrevs[7] = { "SG", "CG", "RL", "RI", "GL", "PI", "FI" };
+        static const char * const prefers[7] = { "1", "2", "3", "4", "5", "6", "7" };
+
+        float startx = weaponbarx(w, h), by = 1646.0f;
+
+        sethudshader(false);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        loopi(7)
+        {
+            int gun = gunsorder[i];
+            bool hasammo = d->ammo[gun] > 0;
+            bool selected = d->gunselect == gun;
+            float bx = startx + i*(WEAPONBOX_W + WEAPONBOX_GAP);
+
+            if(selected) gle::colorf(0.16f, 0.24f, 0.34f, 0.78f);
+            else if(hasammo) gle::colorf(0.05f, 0.05f, 0.05f, 0.58f);
+            else gle::colorf(0.04f, 0.04f, 0.04f, 0.32f);
+            drawsolidrect(bx, by, WEAPONBOX_W, WEAPONBOX_H);
+
+            if(selected) gle::colorf(1.0f, 0.85f, 0.25f, 0.95f);
+            else if(hasammo) gle::colorf(0.75f, 0.75f, 0.75f, 0.65f);
+            else gle::colorf(0.35f, 0.35f, 0.35f, 0.35f);
+            drawboxborder(bx, by, WEAPONBOX_W, WEAPONBOX_H, selected ? 3.5f : 2.0f);
+        }
+
+        sethudshader(true);
+        float iconsz = 74.0f;
+        loopi(7)
+        {
+            int gun = gunsorder[i];
+            bool hasammo = d->ammo[gun] > 0;
+            bool selected = d->gunselect == gun;
+            float bx = startx + i*(WEAPONBOX_W + WEAPONBOX_GAP);
+            float ix = bx + (WEAPONBOX_W - iconsz)*0.5f;
+            float iy = by + (WEAPONBOX_H - iconsz)*0.5f - 2.0f;
+
+            if(!hasammo) gle::colorf(0.35f, 0.35f, 0.35f, 0.38f);
+            else if(selected) gle::colorf(1.0f, 1.0f, 1.0f, 1.0f);
+            else gle::colorf(0.9f, 0.9f, 0.9f, 0.85f);
+            drawicon(HICON_FIST+gun, ix, iy, iconsz);
+        }
+        gle::colorf(1, 1, 1, 1);
+
+        loopi(7)
+        {
+            int gun = gunsorder[i];
+            bool hasammo = d->ammo[gun] > 0;
+            bool selected = d->gunselect == gun;
+            float bx = startx + i*(WEAPONBOX_W + WEAPONBOX_GAP);
+
+            const char *key = findweaponbind(abbrevs[i], prefers[i]);
+            if(key && key[0])
+            {
+                int kw = 0, kh = 0;
+                text_bounds(key, kw, kh);
+                float ks = kw > 0 ? min(0.62f, (WEAPONBOX_W*0.52f)/kw) : 0.62f;
+                int kr = !hasammo ? 130 : (selected ? 255 : 225);
+                int kg = !hasammo ? 130 : (selected ? 225 : 225);
+                int kb = !hasammo ? 130 : (selected ? 100 : 225);
+                int ka = !hasammo ? 140 : (selected ? 255 : 225);
+                pushhudmatrix();
+                hudmatrix.scale(ks, ks, 1);
+                flushhudmatrix();
+                draw_text(key, int((bx + 9.0f)/ks), int((by + 6.0f)/ks), kr, kg, kb, ka);
+                pophudmatrix();
+            }
+
+            if(gun != GUN_FIST)
+            {
+                defformatstring(ammostr, "%d", d->ammo[gun]);
+                int aw = 0, ah = 0;
+                text_bounds(ammostr, aw, ah);
+                float as = 0.72f;
+                int ar = !hasammo ? 125 : (selected ? 255 : 240);
+                int ag = !hasammo ? 125 : (selected ? 255 : 240);
+                int ab = !hasammo ? 125 : (selected ? 255 : 240);
+                int aa = !hasammo ? 145 : (selected ? 255 : 240);
+                pushhudmatrix();
+                hudmatrix.scale(as, as, 1);
+                flushhudmatrix();
+                draw_text(ammostr, int((bx + WEAPONBOX_W - 9.0f)/as - aw), int((by + WEAPONBOX_H - 5.0f)/as - ah), ar, ag, ab, aa);
+                pophudmatrix();
+            }
+        }
+        gle::colorf(1, 1, 1, 1);
+    }
+
+    static void drawkillfeed(int w, int h)
+    {
+        if(!killfeed || killfeedentries.empty()) return;
+
+        while(killfeedentries.length() && totalmillis - killfeedentries.last().time >= killfeedtime)
+            killfeedentries.pop();
+        if(killfeedentries.empty()) return;
+
+        const float ts = 0.62f;
+        const float boxh = 54.0f;
+        const float rowgap = 8.0f;
+        const float padx = 16.0f;
+        const float midgap = 14.0f;
+        const float iconsz = 40.0f;
+        int fw = 0, fh = 0;
+        text_bounds(" ", fw, fh);
+        float rightx = 1800.0f*w/h - 36.0f;
+        float y = needminimap() ? 535.0f : 36.0f;
+
+        loopv(killfeedentries)
+        {
+            killfeedentry &e = killfeedentries[i];
+            int elapsed = totalmillis - e.time;
+            if(elapsed < 0) elapsed = 0;
+            if(elapsed >= killfeedtime) continue;
+
+            int fade = min(killfeedfade, killfeedtime);
+            int fadestart = killfeedtime - fade;
+            float alpha = (fade > 0 && elapsed > fadestart) ? clamp(1.0f - float(elapsed - fadestart)/float(fade), 0.0f, 1.0f) : 1.0f;
+            int a = clamp(int(alpha*255.0f), 0, 255);
+            if(a <= 0) continue;
+
+            bool hasicon = !e.suicide && e.gun >= GUN_FIST && e.gun <= GUN_PISTOL;
+            const char *midtext = e.suicide ? "\fs\f4suicided\fr" : "\fs\f4killed\fr";
+
+            int kw = 0, kh = 0, vw = 0, vh = 0, mw = 0, mh = 0;
+            if(!e.suicide && e.killer[0]) text_bounds(e.killer, kw, kh);
+            text_bounds(e.victim, vw, vh);
+            if(!hasicon) text_bounds(midtext, mw, mh);
+
+            float killerw = (!e.suicide && e.killer[0]) ? kw*ts : 0.0f;
+            float victimw = vw*ts;
+            float midw = hasicon ? iconsz : mw*ts;
+
+            float contentw = 0.0f;
+            if(e.suicide)
+                contentw = victimw + midgap + midw;
+            else if(killerw > 0.0f)
+                contentw = killerw + midgap + midw + midgap + victimw;
+            else
+                contentw = midw + midgap + victimw;
+
+            float boxw = contentw + 2.0f*padx;
+            float bx = rightx - boxw;
+
+            sethudshader(false);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            gle::colorf(0.05f, 0.05f, 0.05f, 0.58f*alpha);
+            drawsolidrect(bx, y, boxw, boxh);
+
+            if(e.teamkill) gle::colorf(1.0f, 0.45f, 0.15f, 0.85f*alpha);
+            else if(e.selfinvolved) gle::colorf(1.0f, 0.85f, 0.25f, 0.85f*alpha);
+            else gle::colorf(0.75f, 0.75f, 0.75f, 0.45f*alpha);
+            drawboxborder(bx, y, boxw, boxh, e.selfinvolved ? 2.5f : 1.8f);
+
+            sethudshader(true);
+            float cx = bx + padx;
+            float texty = y + (boxh - fh*ts)*0.5f;
+
+            if(e.suicide)
+            {
+                pushhudmatrix();
+                hudmatrix.scale(ts, ts, 1);
+                flushhudmatrix();
+                draw_text(e.victim, int(cx/ts), int(texty/ts), 255, 255, 255, a);
+                draw_text(midtext, int((cx + victimw + midgap)/ts), int(texty/ts), 255, 255, 255, a);
+                pophudmatrix();
+            }
+            else
+            {
+                if(killerw > 0.0f)
+                {
+                    pushhudmatrix();
+                    hudmatrix.scale(ts, ts, 1);
+                    flushhudmatrix();
+                    draw_text(e.killer, int(cx/ts), int(texty/ts), 255, 255, 255, a);
+                    pophudmatrix();
+                    cx += killerw + midgap;
+                }
+
+                if(hasicon)
+                {
+                    gle::colorf(1.0f, 1.0f, 1.0f, alpha);
+                    drawicon(HICON_FIST + e.gun, cx, y + (boxh - iconsz)*0.5f, iconsz);
+                    gle::colorf(1.0f, 1.0f, 1.0f, 1.0f);
+                }
+                else
+                {
+                    pushhudmatrix();
+                    hudmatrix.scale(ts, ts, 1);
+                    flushhudmatrix();
+                    draw_text(midtext, int(cx/ts), int(texty/ts), 255, 255, 255, a);
+                    pophudmatrix();
+                }
+                cx += midw + midgap;
+
+                pushhudmatrix();
+                hudmatrix.scale(ts, ts, 1);
+                flushhudmatrix();
+                draw_text(e.victim, int(cx/ts), int(texty/ts), 255, 255, 255, a);
+                pophudmatrix();
+            }
+
+            y += boxh + rowgap;
+        }
+        gle::colorf(1.0f, 1.0f, 1.0f, 1.0f);
+    }
+
+    void drawhudicons(fpsent *d, int w, int h)
+    {
+        int armourx = HICON_X + 350;
+
+        pushhudmatrix();
+        hudmatrix.scale(2, 2, 1);
+        flushhudmatrix();
+
+        draw_textf("%d", (HICON_X + HICON_SIZE + HICON_SPACE)/2, HICON_TEXTY/2, d->state==CS_DEAD ? 0 : d->health);
+        if(d->state!=CS_DEAD && d->armour)
+            draw_textf("%d", (armourx + HICON_SIZE + HICON_SPACE)/2, HICON_TEXTY/2, d->armour);
+
+        pophudmatrix();
+
+        drawicon(HICON_HEALTH, HICON_X, HICON_Y);
+        if(d->state!=CS_DEAD)
+        {
+            if(d->armour) drawicon(HICON_BLUE_ARMOUR+d->armourtype, armourx, HICON_Y);
+            drawweaponhud(d, w, h);
+            if(d->quadmillis) drawicon(HICON_QUAD, hudextrax(w, h), HICON_Y);
+        }
+    }
+
+    void gameplayhud(int w, int h)
+    {
+        pushhudmatrix();
+        hudmatrix.scale(h/1800.0f, h/1800.0f, 1);
+        flushhudmatrix();
+
+        if(player1->state==CS_SPECTATOR)
+        {
+            int pw, ph, tw, th, fw, fh;
+            text_bounds("  ", pw, ph);
+            text_bounds("SPECTATOR", tw, th);
+            th = max(th, ph);
+            fpsent *f = followingplayer();
+            text_bounds(f ? colorname(f) : " ", fw, fh);
+            fh = max(fh, ph);
+            draw_text("SPECTATOR", w*1800/h - tw - pw, 1650 - th - fh);
+            if(f) 
+            {
+                int color = f->state!=CS_DEAD ? 0xFFFFFF : 0x606060;
+                if(f->privilege)
+                {
+                    color = f->privilege>=PRIV_ADMIN ? 0xFF8000 : 0x40FF80;
+                    if(f->state==CS_DEAD) color = (color>>1)&0x7F7F7F;
+                }
+                draw_text(colorname(f), w*1800/h - fw - pw, 1650 - fh, (color>>16)&0xFF, (color>>8)&0xFF, color&0xFF);
+            }
+        }
+
+        fpsent *d = hudplayer();
+        if(d->state!=CS_EDITING)
+        {
+            if(d->state!=CS_SPECTATOR) drawhudicons(d, w, h);
+            if(cmode) cmode->drawhud(d, w, h);
+            drawkillfeed(w, h);
+        }
+
+        pophudmatrix();
+    }
+
+    int clipconsole(int w, int h)
+    {
+        if(cmode) return cmode->clipconsole(w, h);
+        return 0;
+    }
+
+    VARP(teamcrosshair, 0, 1, 1);
+    VARP(hitcrosshair, 0, 425, 1000);
+
+    const char *defaultcrosshair(int index)
+    {
+        switch(index)
+        {
+            case 2: return "data/hit.png";
+            case 1: return "data/teammate.png";
+            default: return "data/crosshair.png";
+        }
+    }
+
+    int selectcrosshair(vec &color)
+    {
+        fpsent *d = hudplayer();
+        if(d->state==CS_SPECTATOR || d->state==CS_DEAD) return -1;
+
+        if(d->state!=CS_ALIVE) return 0;
+
+        int crosshair = 0;
+        if(lasthit && lastmillis - lasthit < hitcrosshair) crosshair = 2;
+        else if(teamcrosshair)
+        {
+            dynent *o = intersectclosest(d->o, worldpos, d);
+            if(o && o->type==ENT_PLAYER && isteam(((fpsent *)o)->team, d->team))
+            {
+                crosshair = 1;
+                color = vec(0, 0, 1);
+            }
+        }
+
+        if(crosshair!=1 && !editmode && !m_insta)
+        {
+            if(d->health<=25) color = vec(1, 0, 0);
+            else if(d->health<=50) color = vec(1, 0.5f, 0);
+        }
+        if(d->gunwait) color.mul(0.5f);
+        return crosshair;
+    }
+
+    void lighteffects(dynent *e, vec &color, vec &dir)
+    {
+#if 0
+        fpsent *d = (fpsent *)e;
+        if(d->state!=CS_DEAD && d->quadmillis)
+        {
+            float t = 0.5f + 0.5f*sinf(2*M_PI*lastmillis/1000.0f);
+            color.y = color.y*(1-t) + t;
+        }
+#endif
+    }
+
+    bool serverinfostartcolumn(g3d_gui *g, int i)
+    {
+        static const char * const names[] = { "ping ", "players ", "mode ", "map ", "time ", "master ", "host ", "port ", "description " };
+        static const float struts[] =       { 7,       7,          12.5f,   14,      7,      8,         14,      7,       24.5f };
+        if(size_t(i) >= sizeof(names)/sizeof(names[0])) return false;
+        g->pushlist();
+        g->text(names[i], 0xFFFF80, !i ? " " : NULL);
+        if(struts[i]) g->strut(struts[i]);
+        g->mergehits(true);
+        return true;
+    }
+
+    void serverinfoendcolumn(g3d_gui *g, int i)
+    {
+        g->mergehits(false);
+        g->column(i);
+        g->poplist();
+    }
+
+    const char *mastermodecolor(int n, const char *unknown)
+    {
+        return (n>=MM_START && size_t(n-MM_START)<sizeof(mastermodecolors)/sizeof(mastermodecolors[0])) ? mastermodecolors[n-MM_START] : unknown;
+    }
+
+    const char *mastermodeicon(int n, const char *unknown)
+    {
+        return (n>=MM_START && size_t(n-MM_START)<sizeof(mastermodeicons)/sizeof(mastermodeicons[0])) ? mastermodeicons[n-MM_START] : unknown;
+    }
+
+    bool serverinfoentry(g3d_gui *g, int i, const char *name, int port, const char *sdesc, const char *map, int ping, const vector<int> &attr, int np)
+    {
+        if(ping < 0 || attr.empty() || attr[0]!=PROTOCOL_VERSION)
+        {
+            switch(i)
+            {
+                case 0:
+                    if(g->button(" ", 0xFFFFDD, "serverunk")&G3D_UP) return true;
+                    break;
+
+                case 1:
+                case 2:
+                case 3:
+                case 4:
+                case 5:
+                    if(g->button(" ", 0xFFFFDD)&G3D_UP) return true;
+                    break;
+
+                case 6:
+                    if(g->buttonf("%s ", 0xFFFFDD, NULL, name)&G3D_UP) return true;
+                    break;
+
+                case 7:
+                    if(g->buttonf("%d ", 0xFFFFDD, NULL, port)&G3D_UP) return true;
+                    break;
+
+                case 8:
+                    if(ping < 0)
+                    {
+                        if(g->button(sdesc, 0xFFFFDD)&G3D_UP) return true;
+                    }
+                    else if(g->buttonf("[%s protocol] ", 0xFFFFDD, NULL, attr.empty() ? "unknown" : (attr[0] < PROTOCOL_VERSION ? "older" : "newer"))&G3D_UP) return true;
+                    break;
+            }
+            return false;
+        }
+
+        switch(i)
+        {
+            case 0:
+            {
+                const char *icon = attr.inrange(3) && np >= attr[3] ? "serverfull" : (attr.inrange(4) ? mastermodeicon(attr[4], "serverunk") : "serverunk");
+                if(g->buttonf("%d ", 0xFFFFDD, icon, ping)&G3D_UP) return true;
+                break;
+            }
+
+            case 1:
+                if(attr.length()>=4)
+                {
+                    if(g->buttonf(np >= attr[3] ? "\f3%d/%d " : "%d/%d ", 0xFFFFDD, NULL, np, attr[3])&G3D_UP) return true;
+                }
+                else if(g->buttonf("%d ", 0xFFFFDD, NULL, np)&G3D_UP) return true;
+                break;
+
+            case 2:
+                if(g->buttonf("%s ", 0xFFFFDD, NULL, attr.length()>=2 ? server::modename(attr[1], "") : "")&G3D_UP) return true;
+                break;
+
+            case 3:
+                if(g->buttonf("%.25s ", 0xFFFFDD, NULL, map)&G3D_UP) return true;
+                break;
+
+            case 4:
+                if(attr.length()>=3 && attr[2] > 0)
+                {
+                    int secs = clamp(attr[2], 0, 59*60+59),
+                        mins = secs/60;
+                    secs %= 60;
+                    if(g->buttonf("%d:%02d ", 0xFFFFDD, NULL, mins, secs)&G3D_UP) return true;
+                }
+                else if(g->buttonf(" ", 0xFFFFDD)&G3D_UP) return true;
+                break;
+            case 5:
+                if(g->buttonf("%s%s ", 0xFFFFDD, NULL, attr.length()>=5 ? mastermodecolor(attr[4], "") : "", attr.length()>=5 ? server::mastermodename(attr[4], "") : "")&G3D_UP) return true;
+                break;
+
+            case 6:
+                if(g->buttonf("%s ", 0xFFFFDD, NULL, name)&G3D_UP) return true;
+                break;
+
+            case 7:
+                if(g->buttonf("%d ", 0xFFFFDD, NULL, port)&G3D_UP) return true;
+                break;
+
+            case 8:
+                if(g->buttonf("%.25s", 0xFFFFDD, NULL, sdesc)&G3D_UP) return true;
+                break;
+        }
+        return false;
+    }
+
+    // any data written into this vector will get saved with the map data. Must take care to do own versioning, and endianess if applicable. Will not get called when loading maps from other games, so provide defaults.
+    void writegamedata(vector<char> &extras) {}
+    void readgamedata(vector<char> &extras) {}
+
+    const char *savedconfig() { return "config.cfg"; }
+    const char *restoreconfig() { return "restore.cfg"; }
+    const char *defaultconfig() { return "data/defaults.cfg"; }
+    const char *autoexec() { return "autoexec.cfg"; }
+    const char *savedservers() { return "servers.cfg"; }
+
+    void loadconfigs()
+    {
+        if(identexists("playsong")) execute("playsong");
+
+        execfile("auth.cfg", false);
+    }
+}
+

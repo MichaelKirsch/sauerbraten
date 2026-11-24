@@ -1,0 +1,25 @@
+CompileFlags:
+  Add:
+    - -I/Users/michaelkirsch/sauerbraten/src/shared
+    - -I/Users/michaelkirsch/sauerbraten/src/engine
+    - -I/Users/michaelkirsch/sauerbraten/src/fpsgame
+    - -I/Users/michaelkirsch/sauerbraten/src/enet/include
+    - -I/Users/michaelkirsch/sauerbraten/src/include
+    - -F/Users/michaelkirsch/sauerbraten/src/xcode/Frameworks
+    - -isysroot
+    - /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk
+    - -arch
+    - x86_64
+    - -fsigned-char
+    - -fno-exceptions
+    - -fno-rtti
+    - -Wno-deprecated-declarations
+    - -DGL_SILENCE_DEPRECATION
+
+---
+If:
+  PathMatch: src/.*\.h$
+CompileFlags:
+  Add:
+    - -x
+    - c++
