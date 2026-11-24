@@ -686,6 +686,7 @@ namespace game
         virtual bool aicheck(fpsent *d, ai::aistate &b) { return false; }
         virtual bool aidefend(fpsent *d, ai::aistate &b) { return false; }
         virtual bool aipursue(fpsent *d, ai::aistate &b) { return false; }
+        virtual bool hasobjective(fpsent *d) { return false; }
     };
 
     extern clientmode *cmode;

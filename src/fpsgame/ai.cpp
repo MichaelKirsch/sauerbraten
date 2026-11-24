@@ -265,6 +265,7 @@ namespace ai
 
     bool badhealth(fpsent *d)
     {
+        if(m_insta) return false;
         if(d->skill <= 100) return d->health <= (111-d->skill)/4;
         return false;
     }
@@ -384,8 +385,9 @@ namespace ai
 
     bool hasgoodammo(fpsent *d)
     {
+        if(m_insta) return d->hasammo(GUN_RIFLE);
         static const int goodguns[] = { GUN_CG, GUN_RL, GUN_SG, GUN_RIFLE };
-        loopi(sizeof(goodguns)/sizeof(goodguns[0])) if(d->hasammo(goodguns[0])) return true;
+        loopi(sizeof(goodguns)/sizeof(goodguns[0])) if(d->hasammo(goodguns[i])) return true;
         if(d->ammo[GUN_GL] > 5) return true;
         return false;
     }
@@ -470,7 +472,7 @@ namespace ai
                 case AI_S_DEFEND: // don't get into herds
                 {
                     int members = 0;
-                    proceed = !checkothers(targets, d, n.state, n.targtype, n.target, true, &members) && members > 1;
+                    proceed = !checkothers(targets, d, n.state, n.targtype, n.target, true, &members) && (n.targtype == AI_T_AFFINITY || members > 1);
                     break;
                 }
                 default: break;
@@ -1035,13 +1037,15 @@ namespace ai
             else if(!enemyok && target(d, b, d->gunselect == GUN_FIST ? 1 : 0, false, SIGHTMIN))
                 enemyok = (e = getclient(d->ai->enemy)) != NULL;
         }
+        bool insight = false;
         if(enemyok)
         {
             vec ep = getaimpos(d, e);
             float yaw, pitch;
             getyawpitch(dp, ep, yaw, pitch);
             fixrange(yaw, pitch);
-            bool insight = cansee(d, dp, ep), hasseen = d->ai->enemyseen && lastmillis-d->ai->enemyseen <= (d->skill*10)+3000,
+            insight = cansee(d, dp, ep);
+            bool hasseen = d->ai->enemyseen && lastmillis-d->ai->enemyseen <= (d->skill*10)+3000,
                 quick = d->ai->enemyseen && lastmillis-d->ai->enemyseen <= (d->gunselect == GUN_CG ? 300 : skmod)+30;
             if(insight) d->ai->enemyseen = lastmillis;
             if(idle || insight || hasseen || quick)
@@ -1102,7 +1106,23 @@ namespace ai
         }
         else d->ai->becareful = false;
 
-        if(d->ai->dontmove) d->move = d->strafe = 0;
+        if(d->ai->dontmove)
+        {
+            d->move = d->strafe = 0;
+            if(enemyok && insight && b.idle != 1 && d->skill >= 30 && !d->timeinair && d->physstate >= PHYS_SLOPE && !d->ai->becareful)
+            {
+                int sdir = ((lastmillis/450 + d->clientnum)&1) ? 1 : -1;
+                vec side;
+                vecfromyawpitch(d->yaw + 90.0f*sdir, 0, 1, 0, side);
+                vec probe = vec(d->o).add(vec(side).mul(24.0f));
+                vec floor;
+                if(raycube(d->o, side, 24.0f, RAY_CLIPMAT) >= 24.0f)
+                {
+                    float fdist = rayfloor(probe, floor, 0, d->radius);
+                    if(fdist >= 0 && fdist <= d->eyeheight + 16.0f) d->strafe = sdir;
+                }
+            }
+        }
         else
         { // our guys move one way.. but turn another?! :)
             const struct aimdir { int move, strafe, offset; } aimdirs[8] =
@@ -1140,29 +1160,91 @@ namespace ai
         return false;
     }
 
+    static int scoreweapon(fpsent *d, fpsent *e, int gun, float dist2)
+    {
+        if(!d->hasammo(gun) || !hasrange(d, e, gun)) return -1;
+        int score = 0;
+        if(e && targetable(d, e))
+        {
+            if(dist2 < 90.0f*90.0f)
+            {
+                switch(gun)
+                {
+                    case GUN_SG:     score = 100; break;
+                    case GUN_CG:     score = 85;  break;
+                    case GUN_RL:     score = dist2 > 55.0f*55.0f ? 80 : 10; break;
+                    case GUN_RIFLE:  score = 55;  break;
+                    case GUN_GL:     score = dist2 > 60.0f*60.0f ? 40 : 5;  break;
+                    case GUN_PISTOL: score = 30;  break;
+                    case GUN_FIST:   score = 15;  break;
+                    default: break;
+                }
+            }
+            else if(dist2 < 350.0f*350.0f)
+            {
+                switch(gun)
+                {
+                    case GUN_CG:     score = 100; break;
+                    case GUN_RL:     score = 90;  break;
+                    case GUN_SG:     score = 70;  break;
+                    case GUN_RIFLE:  score = 65;  break;
+                    case GUN_GL:     score = 55;  break;
+                    case GUN_PISTOL: score = 30;  break;
+                    case GUN_FIST:   score = 5;   break;
+                    default: break;
+                }
+            }
+            else
+            {
+                switch(gun)
+                {
+                    case GUN_RIFLE:  score = 100; break;
+                    case GUN_CG:     score = 80;  break;
+                    case GUN_RL:     score = 70;  break;
+                    case GUN_PISTOL: score = 35;  break;
+                    case GUN_SG:     score = 20;  break;
+                    case GUN_GL:     score = 15;  break;
+                    case GUN_FIST:   score = 0;   break;
+                    default: break;
+                }
+            }
+            if(gun == d->ai->weappref && score >= 40) score += 15;
+        }
+        else
+        {
+            static const int idleorder[NUMGUNS] = { 10, 85, 100, 90, 80, 60, 30 };
+            if(gun >= 0 && gun < NUMGUNS) score = idleorder[gun];
+            if(gun == d->ai->weappref) score += 25;
+        }
+        return score;
+    }
+
     bool request(fpsent *d, aistate &b)
     {
         fpsent *e = getclient(d->ai->enemy);
-        if(!d->hasammo(d->gunselect) || !hasrange(d, e, d->gunselect) || (d->gunselect != d->ai->weappref && (!isgoodammo(d->gunselect) || d->hasammo(d->ai->weappref))))
+        if(m_insta)
         {
+            int gun = d->hasammo(GUN_RIFLE) ? GUN_RIFLE : GUN_FIST;
+            if(gun != d->gunselect) gunselect(gun, d);
+        }
+        else
+        {
+            float dist2 = (e && targetable(d, e)) ? getaimpos(d, e).squaredist(d->headpos()) : 0.0f;
             static const int gunprefs[] = { GUN_CG, GUN_RL, GUN_SG, GUN_RIFLE, GUN_GL, GUN_PISTOL, GUN_FIST };
-            int gun = -1;
-            if(d->hasammo(d->ai->weappref) && hasrange(d, e, d->ai->weappref)) gun = d->ai->weappref;
-            else
+            int bestgun = -1, bestscore = -1;
+            loopi(sizeof(gunprefs)/sizeof(gunprefs[0]))
             {
-                loopi(sizeof(gunprefs)/sizeof(gunprefs[0])) if(d->hasammo(gunprefs[i]) && hasrange(d, e, gunprefs[i]))
-                {
-                    gun = gunprefs[i];
-                    break;
-                }
+                int s = scoreweapon(d, e, gunprefs[i], dist2);
+                if(s > bestscore) { bestscore = s; bestgun = gunprefs[i]; }
             }
-            if(gun >= 0 && gun != d->gunselect) gunselect(gun, d);
+            if(bestgun >= 0 && bestgun != d->gunselect) gunselect(bestgun, d);
         }
         return process(d, b) >= 2;
     }
 
 	void timeouts(fpsent *d, aistate &b)
 	{
+        bool carrying = cmode && cmode->hasobjective(d);
         if(d->blocked)
         {
             d->ai->blocktime += lastmillis-d->ai->lastrun;
@@ -1177,7 +1259,15 @@ namespace ai
                         break;
                     case 4: d->ai->reset(true); break;
                     case 5: d->ai->reset(false); break;
-                    case 6: default: suicide(d); return; break; // this is our last resort..
+                    default:
+                        if(carrying && d->ai->blockseq < 10)
+                        {
+                            d->ai->clear(true);
+                            randomnode(d, b, SIGHTMIN, 1e16f);
+                            d->jumping = true;
+                        }
+                        else { suicide(d); return; }
+                        break;
                 }
             }
         }
@@ -1197,7 +1287,15 @@ namespace ai
                         break;
                     case 4: d->ai->reset(true); break;
                     case 5: d->ai->reset(false); break;
-                    case 6: default: suicide(d); return; break; // this is our last resort..
+                    default:
+                        if(carrying && d->ai->targseq < 10)
+                        {
+                            d->ai->clear(true);
+                            randomnode(d, b, SIGHTMIN, 1e16f);
+                            d->jumping = true;
+                        }
+                        else { suicide(d); return; }
+                        break;
                 }
             }
         }
@@ -1218,7 +1316,15 @@ namespace ai
                 {
                     case 1: d->ai->reset(true); break;
                     case 2: d->ai->reset(false); break;
-                    case 3: default: suicide(d); return; break; // this is our last resort..
+                    default:
+                        if(carrying && d->ai->huntseq < 5)
+                        {
+                            d->ai->clear(true);
+                            randomnode(d, b, SIGHTMIN, 1e16f);
+                            d->jumping = true;
+                        }
+                        else { suicide(d); return; }
+                        break;
                 }
             }
         }
